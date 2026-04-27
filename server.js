@@ -10,8 +10,7 @@ const io = socketIo(server, {
     cors: { origin: "*", methods: ["GET", "POST"] },
     maxHttpBufferSize: 1e6,
     pingTimeout: 60000,
-    pingInterval: 25000
-});
+    pingInterval: 25000});
 
 app.use(express.json({ limit: '1mb' }));
 app.use(express.static('public'));
@@ -21,7 +20,6 @@ class DDoSProtection {
     constructor() {
         this.ipRequests = new Map();
         this.config = {
-            globalRateLimit: 200,
             ipRateLimit: 30,
             ipRateLimitPerSecond: 5,
             banDuration: 30 * 60 * 1000,
@@ -35,7 +33,6 @@ class DDoSProtection {
                 '/api/my-tickets': { limit: 60, perMinutes: 1, banOnExceed: false }
             }
         };
-        this.staticBlacklist = new Set();
         
         setInterval(() => this.cleanup(), 5 * 60 * 1000);
     }
@@ -54,9 +51,6 @@ class DDoSProtection {
         if (data && data.blockedUntil && Date.now() < data.blockedUntil) {
             return { blocked: true, reason: 'IP заблокирован', until: data.blockedUntil };
         }
-        if (this.staticBlacklist.has(ip)) {
-            return { blocked: true, reason: 'IP в чёрном списке' };
-        }
         return { blocked: false };
     }
     
@@ -68,37 +62,23 @@ class DDoSProtection {
         let ipData = this.ipRequests.get(ip);
         if (!ipData) {
             ipData = {
-                count: 0,
-                firstRequest: now,
                 lastRequest: now,
-                requestsPerSecond: [],
+                requestTimes: [],
                 endpointCounts: new Map()
             };
             this.ipRequests.set(ip, ipData);
         }
         
-        const minuteAgo = now - 60 * 1000;
-        let requestsLastMinute = 0;
-        for (const [checkIp, data] of this.ipRequests.entries()) {
-            if (checkIp === ip && data.lastRequest > minuteAgo) {
-                requestsLastMinute++;
-            }
+        ipData.requestTimes = ipData.requestTimes.filter(t => now - t < 60000);
+        ipData.requestTimes.push(now);
+        
+        if (ipData.requestTimes.length > this.config.ipRateLimit) {
+            return this.banIP(ip, `Превышен лимит: ${ipData.requestTimes.length}/${this.config.ipRateLimit} в минуту`);
         }
         
-        if (requestsLastMinute > this.config.ipRateLimit) {
-            return this.banIP(ip, `Превышен лимит: ${requestsLastMinute}/${this.config.ipRateLimit} в минуту`);
-        }
-        
-        const secondAgo = now - 1000;
-        let requestsLastSecond = 0;
-        for (const [checkIp, data] of this.ipRequests.entries()) {
-            if (checkIp === ip && data.lastRequest > secondAgo) {
-                requestsLastSecond++;
-            }
-        }
-        
-        if (requestsLastSecond > this.config.ipRateLimitPerSecond) {
-            return this.tempBanIP(ip, `Превышен лимит: ${requestsLastSecond}/${this.config.ipRateLimitPerSecond} запросов/сек`);
+        const lastSecond = ipData.requestTimes.filter(t => now - t < 1000);
+        if (lastSecond.length > this.config.ipRateLimitPerSecond) {
+            return this.tempBanIP(ip, `Превышен лимит: ${lastSecond.length} запросов/сек`);
         }
         
         if (this.config.endpoints[endpoint]) {
@@ -120,7 +100,6 @@ class DDoSProtection {
             }
         }
         
-        ipData.lastRequest = now;
         return { allowed: true };
     }
     
@@ -131,7 +110,6 @@ class DDoSProtection {
             this.ipRequests.set(ip, ipData);
         }
         ipData.blockedUntil = Date.now() + this.config.banDuration;
-        ipData.banReason = reason;
         console.warn(`🚫 IP ${ip} ЗАБЛОКИРОВАН: ${reason}`);
         return { allowed: false, reason: 'IP заблокирован за нарушение правил', blocked: true };
     }
@@ -143,15 +121,14 @@ class DDoSProtection {
             this.ipRequests.set(ip, ipData);
         }
         ipData.blockedUntil = Date.now() + this.config.tempBanDuration;
-        ipData.banReason = reason;
-        console.warn(`⚠️ IP ${ip} ВРЕМЕННО ЗАБЛОКИРОВАН (5 мин): ${reason}`);
+        console.warn(`⚠️ IP ${ip} ВРЕМЕННО ЗАБЛОКИРОВАН: ${reason}`);
         return { allowed: false, reason: 'Слишком много запросов. Подождите 5 минут.', blocked: true, temporary: true };
     }
 }
 
 const ddosProtection = new DDoSProtection();
 
-// Middleware для защиты всех эндпоинтов
+// Middleware для защиты
 const rateLimitMiddleware = (req, res, next) => {
     const ip = req.ip || req.connection.remoteAddress || req.socket.remoteAddress || 'unknown';
     const result = ddosProtection.checkRateLimit(ip, req.path);
@@ -167,27 +144,13 @@ const rateLimitMiddleware = (req, res, next) => {
     next();
 };
 
-// Применяем ко всем API маршрутам
 app.use('/api/', rateLimitMiddleware);
 
-// ============ БАЗА ДАННЫХ ============
+// ============ ПОДКЛЮЧЕНИЕ К БАЗЕ ДАННЫХ ============
 const db = new sqlite3.Database('monolith.db');
-
-// Функция для безопасного добавления колонки
-function addColumnIfNotExists(table, column, type, callback) {
-    db.run(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`, (err) => {
-        if (err && !err.message.includes('duplicate column')) {
-            console.log(`⚠️ Колонка ${column} уже существует или ошибка: ${err.message}`);
-        } else if (!err) {
-            console.log(`✅ Добавлена колонка ${column} в таблицу ${table}`);
-        }
-        if (callback) callback();
-    });
-}
 
 // Создание таблиц
 db.serialize(() => {
-    // Таблица users
     db.run(`CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         username TEXT UNIQUE,
@@ -197,7 +160,6 @@ db.serialize(() => {
         createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
     
-    // Таблица tickets
     db.run(`CREATE TABLE IF NOT EXISTS tickets (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         userId INTEGER,
@@ -211,7 +173,6 @@ db.serialize(() => {
         resolvedAt DATETIME
     )`);
     
-    // Таблица messages
     db.run(`CREATE TABLE IF NOT EXISTS messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         ticketId INTEGER,
@@ -222,7 +183,6 @@ db.serialize(() => {
         isSystem INTEGER DEFAULT 0
     )`);
     
-    // Таблица logs (создаём с правильными колонками сразу)
     db.run(`CREATE TABLE IF NOT EXISTS logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         userId INTEGER,
@@ -231,47 +191,32 @@ db.serialize(() => {
         details TEXT,
         ip TEXT,
         timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`, (err) => {
-        if (err) {
-            console.log('Ошибка создания logs:', err);
-        } else {
-            console.log('✅ Таблица logs готова');
+    )`);
+    
+    // Добавление колонки ip в logs если её нет
+    db.run(`ALTER TABLE logs ADD COLUMN ip TEXT`, (err) => {
+        if (err && !err.message.includes('duplicate column')) {
+            // колонка уже существует
         }
     });
     
-    // Таблица banned_ips
-    db.run(`CREATE TABLE IF NOT EXISTS banned_ips (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ip TEXT UNIQUE,
-        reason TEXT,
-        bannedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-        expiresAt DATETIME
-    )`);
-    
-    // Добавляем недостающие колонки (для обратной совместимости)
-    setTimeout(() => {
-        addColumnIfNotExists('users', 'lastLoginIP', 'TEXT');
-        addColumnIfNotExists('logs', 'ip', 'TEXT');
-    }, 500);
-    
     // Создание владельца
-    setTimeout(() => {
-        db.get("SELECT * FROM users WHERE role = 'owner'", (err, row) => {
-            if (!row && !err) {
-                db.run(`INSERT INTO users (username, password, role, isBanned) VALUES ('owner', 'owner123', 'owner', 0)`, (err2) => {
-                    if (!err2) console.log('✅ Владелец создан: owner / owner123');
-                });
-            }
-        });
-    }, 1000);
+    db.get("SELECT * FROM users WHERE role = 'owner'", (err, row) => {
+        if (!row && !err) {
+            db.run(`INSERT INTO users (username, password, role, isBanned) VALUES (?, ?, ?, ?)`, 
+                ['owner', 'owner123', 'owner', 0], (err2) => {
+                if (!err2) console.log('✅ Владелец создан: owner / owner123');
+            });
+        }
+    });
+    
+    console.log('✅ База данных инициализирована');
 });
 
 function addLog(userId, username, action, details, ip = null) {
     db.run('INSERT INTO logs (userId, username, action, details, ip) VALUES (?, ?, ?, ?, ?)', 
         [userId || null, username || null, action, details || null, ip], (err) => {
-        if (err) {
-            console.error('Ошибка записи лога:', err.message);
-        }
+        if (err) console.error('Ошибка записи лога:', err.message);
     });
 }
 
@@ -408,19 +353,13 @@ app.post('/api/ban-user', (req, res) => {
     db.get('SELECT role FROM users WHERE id = ?', [userId], (err, targetUser) => {
         if (err) return res.status(500).json({ error: 'Ошибка сервера' });
         if (!targetUser) return res.status(404).json({ error: 'Пользователь не найден' });
-        
-        if (targetUser.role === 'owner') {
-            return res.status(403).json({ error: 'Нельзя заблокировать владельца' });
-        }
-        
+        if (targetUser.role === 'owner') return res.status(403).json({ error: 'Нельзя заблокировать владельца' });
         if (moderatorRole === 'admin' && targetUser.role === 'admin') {
             return res.status(403).json({ error: 'Модератор не может блокировать другого модератора' });
         }
         
         db.run('UPDATE users SET isBanned = 1 WHERE id = ?', [userId], function(err) {
-            if (err) {
-                return res.status(500).json({ error: 'Ошибка блокировки' });
-            }
+            if (err) return res.status(500).json({ error: 'Ошибка блокировки' });
             addLog(moderatorId, moderatorName, 'ban_user', `Заблокирован пользователь ${userId}`);
             res.json({ success: true });
         });
@@ -433,15 +372,10 @@ app.post('/api/unban-user', (req, res) => {
     db.get('SELECT role FROM users WHERE id = ?', [userId], (err, targetUser) => {
         if (err) return res.status(500).json({ error: 'Ошибка сервера' });
         if (!targetUser) return res.status(404).json({ error: 'Пользователь не найден' });
-        
-        if (targetUser.role === 'owner') {
-            return res.status(403).json({ error: 'Нельзя разблокировать владельца' });
-        }
+        if (targetUser.role === 'owner') return res.status(403).json({ error: 'Нельзя разблокировать владельца' });
         
         db.run('UPDATE users SET isBanned = 0 WHERE id = ?', [userId], function(err) {
-            if (err) {
-                return res.status(500).json({ error: 'Ошибка разблокировки' });
-            }
+            if (err) return res.status(500).json({ error: 'Ошибка разблокировки' });
             addLog(moderatorId, moderatorName, 'unban_user', `Разблокирован пользователь ${userId}`);
             res.json({ success: true });
         });
@@ -529,11 +463,10 @@ app.get('/api/security-status', (req, res) => {
 
 // ============ WEBSOCKET ============
 io.on('connection', (socket) => {
-    const ip = socket.handshake.address;
-    console.log(`🔌 Новое подключение: ${socket.id} из ${ip}`);
+    console.log(`🔌 Новое подключение: ${socket.id}`);
     
     socket.on('user-connected', (userData) => {
-        console.log(`👤 Пользователь ${userData.username} онлайн`);
+        console.log(`👤 Пользователь ${userData?.username} онлайн`);
     });
     
     socket.on('join-ticket', (ticketId) => {
@@ -544,41 +477,18 @@ io.on('connection', (socket) => {
         socket.leave(`ticket_${ticketId}`);
     });
     
-    socket.on('new-message', async (data) => {
-        const { ticketId, sender, text } = data;
-        
-        if (!text || text.length > 2000) return;
-        const cleanText = text.replace(/[<>]/g, '');
-        
-        db.run('UPDATE tickets SET lastMessageTime = ?, lastMessageFrom = ? WHERE id = ?', [new Date().toISOString(), sender, ticketId]);
-        db.run('INSERT INTO messages (ticketId, sender, text, isRead) VALUES (?, ?, ?, ?)', [ticketId, sender, cleanText, 0], function(err) {
-            if (!err) {
-                io.to(`ticket_${ticketId}`).emit('message-received', {
-                    id: this.lastID,
-                    ticketId: ticketId,
-                    sender: sender,
-                    text: cleanText,
-                    timestamp: new Date().toISOString()
-                });
-                io.emit('unread-update', { ticketId, sender });
-            }
-        });
-    });
-    
     socket.on('disconnect', () => {
         console.log(`👋 Отключен: ${socket.id}`);
     });
 });
 
 // ============ ЗАПУСК СЕРВЕРА ============
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
     console.log(`\n========================================`);
     console.log(`🛡️ СЕРВЕР ЗАПУЩЕН С АНТИ-DDoS ЗАЩИТОЙ`);
     console.log(`========================================`);
     console.log(`📱 http://localhost:${PORT}`);
     console.log(`👑 Владелец: owner / owner123`);
-    console.log(`⚡ Защита активна: rate limiting, IP блокировки`);
-    console.log(`📊 Rate limit: 30 запросов/мин с IP`);
     console.log(`========================================\n`);
 });
