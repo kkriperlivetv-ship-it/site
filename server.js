@@ -10,27 +10,36 @@ const io = socketIo(server, {
     cors: { origin: "*", methods: ["GET", "POST"] },
     maxHttpBufferSize: 1e6,
     pingTimeout: 60000,
-    pingInterval: 25000});
+    pingInterval: 25000
+});
 
 app.use(express.json({ limit: '1mb' }));
 app.use(express.static('public'));
 
-// ============ DDoS ЗАЩИТА ============
+// Доверять прокси (если сайт за Cloudflare/Nginx)
+app.set('trust proxy', true);
+
+// ============ ОПТИМИЗИРОВАННАЯ DDoS ЗАЩИТА ДЛЯ МНОГИХ ПОЛЬЗОВАТЕЛЕЙ ============
 class DDoSProtection {
     constructor() {
         this.ipRequests = new Map();
         this.config = {
-            ipRateLimit: 30,
-            ipRateLimitPerSecond: 5,
-            banDuration: 30 * 60 * 1000,
-            tempBanDuration: 5 * 60 * 1000,
-            endpoints: {
-                '/api/login': { limit: 5, perMinutes: 5, banOnExceed: true },
-                '/api/register': { limit: 3, perMinutes: 10, banOnExceed: true },
-                '/api/tickets': { limit: 10, perMinutes: 5, banOnExceed: false },
-                '/api/message': { limit: 20, perMinutes: 2, banOnExceed: false },
-                '/api/all-tickets': { limit: 60, perMinutes: 1, banOnExceed: false },
-                '/api/my-tickets': { limit: 60, perMinutes: 1, banOnExceed: false }
+            // ЛИМИТЫ ДЛЯ ОБЫЧНЫХ ПОЛЬЗОВАТЕЛЕЙ (увеличены для множества пользователей)
+            ipRateLimit: 300,           // 300 запросов в минуту с IP (было 30)
+            ipRateLimitPerSecond: 30,   // 30 запросов в секунду (было 5)
+            
+            // БЛОКИРОВКИ
+            banDuration: 60 * 60 * 1000,    // 1 час блокировки
+            tempBanDuration: 15 * 60 * 1000, // 15 минут временной блокировки
+            
+            // ПОРОГИ ДЛЯ ПОДОЗРИТЕЛЬНОЙ АКТИВНОСТИ (только для ботов)
+            suspiciousThreshold: 500,   // 500 запросов/мин - подозрительно
+            banThreshold: 1000,         // 1000 запросов/мин - бан
+            
+            // КРИТИЧЕСКИЕ ЭНДПОИНТЫ (логин/регистрация - жёсткие лимиты)
+            criticalEndpoints: {
+                '/api/login': { limit: 10, perMinutes: 5, banOnExceed: true },
+                '/api/register': { limit: 10, perMinutes: 5, banOnExceed: true }
             }
         };
         
@@ -40,7 +49,8 @@ class DDoSProtection {
     cleanup() {
         const now = Date.now();
         for (const [ip, data] of this.ipRequests.entries()) {
-            if (now - data.lastRequest > 10 * 60 * 1000) {
+            // Очистка данных старше 1 часа
+            if (now - data.lastRequest > 60 * 60 * 1000) {
                 this.ipRequests.delete(ip);
             }
         }
@@ -49,7 +59,7 @@ class DDoSProtection {
     isBlocked(ip) {
         const data = this.ipRequests.get(ip);
         if (data && data.blockedUntil && Date.now() < data.blockedUntil) {
-            return { blocked: true, reason: 'IP заблокирован', until: data.blockedUntil };
+            return { blocked: true, reason: 'IP заблокирован за подозрительную активность', until: data.blockedUntil };
         }
         return { blocked: false };
     }
@@ -64,26 +74,62 @@ class DDoSProtection {
             ipData = {
                 lastRequest: now,
                 requestTimes: [],
-                endpointCounts: new Map()
+                endpointCounts: new Map(),
+                suspiciousScore: 0,
+                warnings: 0
             };
             this.ipRequests.set(ip, ipData);
         }
         
+        // Очистка старых запросов (последняя минута)
         ipData.requestTimes = ipData.requestTimes.filter(t => now - t < 60000);
         ipData.requestTimes.push(now);
         
-        if (ipData.requestTimes.length > this.config.ipRateLimit) {
-            return this.banIP(ip, `Превышен лимит: ${ipData.requestTimes.length}/${this.config.ipRateLimit} в минуту`);
+        const requestsPerMinute = ipData.requestTimes.length;
+        const requestsPerSecond = ipData.requestTimes.filter(t => now - t < 1000).length;
+        
+        // РАСЧЁТ ПОДОЗРИТЕЛЬНОСТИ (только для очень активных IP)
+        if (requestsPerMinute > this.config.suspiciousThreshold) {
+            ipData.suspiciousScore++;
+            console.warn(`⚠️ Подозрительная активность с IP ${ip}: ${requestsPerMinute} запросов/мин`);
+            
+            if (requestsPerMinute > this.config.banThreshold) {
+                return this.banIP(ip, `Автоматический бан: ${requestsPerMinute} запросов/мин`);
+            }
         }
         
-        const lastSecond = ipData.requestTimes.filter(t => now - t < 1000);
-        if (lastSecond.length > this.config.ipRateLimitPerSecond) {
-            return this.tempBanIP(ip, `Превышен лимит: ${lastSecond.length} запросов/сек`);
+        // ОСНОВНАЯ ПРОВЕРКА - только если превышены лимиты
+        if (requestsPerMinute > this.config.ipRateLimit) {
+            if (ipData.warnings < 3) {
+                ipData.warnings++;
+                console.warn(`⚠️ IP ${ip}: ${requestsPerMinute}/${this.config.ipRateLimit} запросов/мин (предупреждение ${ipData.warnings}/3)`);
+                return { allowed: true, warning: true, message: 'Слишком много запросов, снизьте активность' };
+            } else {
+                return this.tempBanIP(ip, `Превышен лимит запросов: ${requestsPerMinute}/${this.config.ipRateLimit} в минуту`);
+            }
         }
         
-        if (this.config.endpoints[endpoint]) {
-            const endpointLimit = this.config.endpoints[endpoint];
-            let endpointData = ipData.endpointCounts.get(endpoint) || { count: 0, resetTime: now + (endpointLimit.perMinutes * 60 * 1000) };
+        if (requestsPerSecond > this.config.ipRateLimitPerSecond) {
+            if (ipData.warnings < 2) {
+                ipData.warnings++;
+                return { allowed: true, warning: true, message: 'Слишком частые запросы' };
+            } else {
+                return this.tempBanIP(ip, `Превышен лимит: ${requestsPerSecond} запросов/сек`);
+            }
+        }
+        
+        // СБРОС ПРЕДУПРЕЖДЕНИЙ (если активность нормализовалась)
+        if (requestsPerMinute < this.config.ipRateLimit / 2 && ipData.warnings > 0) {
+            ipData.warnings = Math.max(0, ipData.warnings - 1);
+        }
+        
+        // КРИТИЧЕСКИЕ ЭНДПОИНТЫ (логин/регистрация - жёсткие лимиты)
+        if (this.config.criticalEndpoints[endpoint]) {
+            const endpointLimit = this.config.criticalEndpoints[endpoint];
+            let endpointData = ipData.endpointCounts.get(endpoint) || { 
+                count: 0, 
+                resetTime: now + (endpointLimit.perMinutes * 60 * 1000) 
+            };
             
             if (now > endpointData.resetTime) {
                 endpointData = { count: 0, resetTime: now + (endpointLimit.perMinutes * 60 * 1000) };
@@ -94,12 +140,13 @@ class DDoSProtection {
             
             if (endpointData.count > endpointLimit.limit) {
                 if (endpointLimit.banOnExceed) {
-                    return this.banIP(ip, `Превышен лимит для ${endpoint}`);
+                    return this.tempBanIP(ip, `Слишком много попыток ${endpoint}`);
                 }
                 return { allowed: false, reason: `Слишком много попыток. Подождите ${endpointLimit.perMinutes} минуты.`, retryAfter: endpointLimit.perMinutes * 60 };
             }
         }
         
+        ipData.lastRequest = now;
         return { allowed: true };
     }
     
@@ -110,6 +157,7 @@ class DDoSProtection {
             this.ipRequests.set(ip, ipData);
         }
         ipData.blockedUntil = Date.now() + this.config.banDuration;
+        ipData.banReason = reason;
         console.warn(`🚫 IP ${ip} ЗАБЛОКИРОВАН: ${reason}`);
         return { allowed: false, reason: 'IP заблокирован за нарушение правил', blocked: true };
     }
@@ -121,8 +169,9 @@ class DDoSProtection {
             this.ipRequests.set(ip, ipData);
         }
         ipData.blockedUntil = Date.now() + this.config.tempBanDuration;
+        ipData.banReason = reason;
         console.warn(`⚠️ IP ${ip} ВРЕМЕННО ЗАБЛОКИРОВАН: ${reason}`);
-        return { allowed: false, reason: 'Слишком много запросов. Подождите 5 минут.', blocked: true, temporary: true };
+        return { allowed: false, reason: 'Слишком много запросов. Подождите 15 минут.', blocked: true, temporary: true };
     }
 }
 
@@ -134,7 +183,7 @@ const rateLimitMiddleware = (req, res, next) => {
     const result = ddosProtection.checkRateLimit(ip, req.path);
     
     if (!result.allowed) {
-        res.setHeader('Retry-After', result.retryAfter || 300);
+        res.setHeader('Retry-After', result.retryAfter || 900);
         return res.status(result.blocked ? 403 : 429).json({ 
             error: result.reason,
             blocked: result.blocked || false
@@ -193,12 +242,13 @@ db.serialize(() => {
         timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
     
-    // Добавление колонки ip в logs если её нет
-    db.run(`ALTER TABLE logs ADD COLUMN ip TEXT`, (err) => {
-        if (err && !err.message.includes('duplicate column')) {
-            // колонка уже существует
-        }
-    });
+    db.run(`CREATE TABLE IF NOT EXISTS banned_ips (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ip TEXT UNIQUE,
+        reason TEXT,
+        bannedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+        expiresAt DATETIME
+    )`);
     
     // Создание владельца
     db.get("SELECT * FROM users WHERE role = 'owner'", (err, row) => {
@@ -490,5 +540,7 @@ server.listen(PORT, () => {
     console.log(`========================================`);
     console.log(`📱 http://localhost:${PORT}`);
     console.log(`👑 Владелец: owner / owner123`);
+    console.log(`📊 Лимиты: 300 запросов/мин, 30/сек с IP`);
+    console.log(`⚠️  Только боты (1000+/мин) блокируются`);
     console.log(`========================================\n`);
 });
