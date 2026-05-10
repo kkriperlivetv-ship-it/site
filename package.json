@@ -1,16 +1,18 @@
 {
   "name": "monolith-ticket-system",
   "version": "1.0.0",
-  "description": "Система тикетов",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
     "express": "^4.18.2",
-    "socket.io": "^4.6.1"
+    "socket.io": "^4.6.1",
+    "sqlite3": "5.1.6"
   },
-  "engines": {
-    "node": "22.x"
+  "overrides": {
+    "sqlite3": {
+      "node-gyp": "10.0.1"
+    }
   }
 }
