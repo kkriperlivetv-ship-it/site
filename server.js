@@ -14,9 +14,8 @@ const io = socketIo(server, {
 app.use(express.json());
 app.use(express.static('public'));
 
-// ============ БАЗА ДАННЫХ ============
-const dbPath = path.join(__dirname, 'monolith.db');
-const db = new sqlite3.Database(dbPath);
+// База данных
+const db = new sqlite3.Database('monolith.db');
 
 // Создание таблиц
 db.serialize(() => {
@@ -35,7 +34,8 @@ db.serialize(() => {
         subject TEXT,
         message TEXT,
         status TEXT DEFAULT 'open',
-        createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
+        createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+        lastActivity DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
     
     db.run(`CREATE TABLE IF NOT EXISTS messages (
@@ -56,16 +56,11 @@ db.serialize(() => {
     });
 });
 
-console.log('✅ База данных готова');
-
-// ============ API ============
-
+// API
 app.post('/api/login', (req, res) => {
     const { username, password } = req.body;
     db.get("SELECT * FROM users WHERE username = ? AND password = ?", [username, password], (err, user) => {
-        if (err || !user) {
-            return res.status(401).json({ error: 'Неверный логин или пароль' });
-        }
+        if (err || !user) return res.status(401).json({ error: 'Неверный логин или пароль' });
         res.json({ success: true, user: { id: user.id, username: user.username, role: user.role } });
     });
 });
@@ -75,7 +70,7 @@ app.post('/api/register', (req, res) => {
     db.run("INSERT INTO users (username, password, role) VALUES (?, ?, ?)", 
         [username, password, 'user'], function(err) {
         if (err) return res.status(400).json({ error: 'Имя занято' });
-        res.json({ success: true, user: { id: this.lastID, username: username, role: 'user' } });
+        res.json({ success: true, user: { id: this.lastID, username, role: 'user' } });
     });
 });
 
@@ -113,6 +108,7 @@ app.post('/api/ticket', (req, res) => {
 
 app.post('/api/message', (req, res) => {
     const { ticketId, sender, text } = req.body;
+    db.run("UPDATE tickets SET lastActivity = CURRENT_TIMESTAMP WHERE id = ?", [ticketId]);
     db.run("INSERT INTO messages (ticketId, sender, text) VALUES (?, ?, ?)",
         [ticketId, sender, text], function(err) {
             if (!err && io) {
@@ -134,7 +130,7 @@ app.post('/api/close-ticket', (req, res) => {
     res.json({ success: true });
 });
 
-// ============ WEBSOCKET ============
+// WebSocket
 io.on('connection', (socket) => {
     console.log('🔌 WebSocket подключен');
     
@@ -151,7 +147,7 @@ io.on('connection', (socket) => {
     });
 });
 
-// ============ ЗАПУСК ============
+// Запуск
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
     console.log(`\n========================================`);

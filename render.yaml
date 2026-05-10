@@ -1,0 +1,14 @@
+# render.yaml
+services:
+  - type: web
+    name: monolith-tickets
+    runtime: node
+    buildCommand: |
+      npm install
+      npm rebuild sqlite3 --build-from-source
+    startCommand: node server.js
+    envVars:
+      - key: NODE_VERSION
+        value: 18.17.0
+      - key: NPM_VERSION
+        value: 9.6.7
